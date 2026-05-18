@@ -29,6 +29,7 @@ class LensCandidate:
     ordered_addition: Optional[str]
     warnings: List[str] = field(default_factory=list)
     fit_notes: str = ""
+    lars_corrected_axis: Optional[int] = None  # axis after LARS correction, None if no trial drift
 
     @property
     def brand(self): return self.lens_data["brand"]
@@ -60,15 +61,23 @@ class MatchingEngine:
            - BC compatibility         (20 pts)
            - Presbyopia / ortho-K bonus (10 pts)
       5. Generate clinical warnings.
+
+    Toric/multifocal rules aligned with J&J Simplifit (2023):
+      - Cyl ≤ −0.75 D  → fit as spherical multifocal (cylinder ignored)
+      - Cyl −1.00/−1.25 D → fit as toric multifocal
+      - Cyl −1.50/−1.75 D → toric multifocal + add −0.25 D to sphere
     """
 
-    BC_DELTA_WARN = 0.30    # mm: deviation between recommended and available BC
-    ASTIG_THRESHOLD = 0.75  # D: cylinder above which a toric lens is required
+    BC_DELTA_WARN = 0.30  
+
+    # Astigmatism thresholds — J&J Simplifit multifocal protocol (2023)
+    ASTIG_SPHERICAL_MF_MAX = 0.75   # D: below/equal → treat as spherical for multifocals
+    ASTIG_TORIC_MF_LOW_MAX = 1.25   # D: 1.00–1.25 → toric multifocal, no sphere adjustment
+    ASTIG_TORIC_MF_HIGH_MAX = 1.75  # D: 1.50–1.75 → toric multifocal + −0.25 D sphere
+    ASTIG_THRESHOLD = 0.75          # D: general threshold for spherical vs toric (non-MF)
 
     def __init__(self):
         self._optics = OpticsEngine()
-
-    # Main API
 
     def find_candidates(
         self,
@@ -91,13 +100,11 @@ class MatchingEngine:
         Returns:
             List sorted by descending score.
         """
-        # 1. Recommended BC
         recommended_bc = self._optics.recommend_bc_from_keratometry(kero)
 
         candidates = []
 
         for lens in LENS_DATABASE:
-            # Preliminary filters
             if lens_type_filter and lens["type"] != lens_type_filter:
                 continue
             if brand_filter and lens["brand"] not in brand_filter:
@@ -110,7 +117,38 @@ class MatchingEngine:
         candidates.sort(key=lambda c: c.score, reverse=True)
         return candidates[:top_n]
 
-    # Lens evaluation
+    # LARS axis correction
+
+    @staticmethod
+    def apply_lars(prescribed_axis: int, drift_degrees: int) -> int:
+        """
+        LARS (Left Add, Right Subtract) rule for toric over-refraction.
+
+        When a toric trial lens is observed to have rotated during a fitting:
+          - If the lens has drifted to the LEFT  (positive drift) → ADD the
+            drift to the prescribed axis.
+          - If the lens has drifted to the RIGHT (negative drift) → SUBTRACT
+            the drift from the prescribed axis.
+
+        Convention used here: drift_degrees > 0 means rotation to the left
+        (counter-clockwise from the practitioner's view), drift_degrees < 0
+        means rotation to the right (clockwise).
+
+        # J&J LARS rule — Contact Lens Spectrum, Gasson & Morris (2010).
+        Reference: Gasson A, Morris J. "The Contact Lens Manual", 4th ed.
+                   (2010), p. 195.
+
+        Args:
+            prescribed_axis: axis from the refraction (degrees, 1–180)
+            drift_degrees:   observed rotation of the trial lens;
+                             positive = left drift, negative = right drift
+
+        Returns:
+            Corrected axis clamped to [1, 180].
+        """
+        corrected = prescribed_axis + drift_degrees  # left: add; right (neg): subtract
+        corrected = corrected % 180
+        return corrected if corrected > 0 else 180
 
     def _evaluate_lens(
         self,
@@ -122,49 +160,107 @@ class MatchingEngine:
         """
         Evaluate a candidate lens.
         Returns None if the lens is incompatible (out of mandatory range).
+
+        Multifocal cylinder handling follows J&J Simplifit rules (2023):
+          ≤ 0.75 D  → spherical multifocal (SE already in cl_rx.sphere for MF)
+          1.00–1.25 D → toric multifocal (no sphere adjustment)
+          1.50–1.75 D → toric multifocal + −0.25 D sphere correction
         """
         warnings = []
         score = 0.0
-        need_cylinder = abs(cl_rx.cylinder) >= self.ASTIG_THRESHOLD
+        is_multifocal = lens.get("add_range") is not None
         need_addition = cl_rx.addition > 0.0
+        abs_cyl = abs(cl_rx.cylinder)
 
-        # Test 1: sphere range
-        sph_min, sph_max = lens["sphere_range"]
-        if not (sph_min <= cl_rx.sphere <= sph_max):
-            return None  # out of range -> hard exclusion
+        # Determine effective sphere (may be adjusted for high-cyl multifocal)
+        effective_sphere = cl_rx.sphere
+        mf_sphere_adjustment = 0.0
 
-        # Test 2: cylinder
-        if need_cylinder:
-            if lens["cylinder_range"] is None:
-                # Spherical lens for an astigmatic patient
-                # Allowed but penalised if astigmatism >= 1.00 D
-                if abs(cl_rx.cylinder) >= 1.00:
-                    return None  # too much astigmatism for a spherical lens
-                else:
-                    warnings.append(
-                        f"Astigmatism {cl_rx.cylinder:.2f} D uncorrected "
-                        f"(< 1.00 D, may be tolerated)."
-                    )
-                    cyl_score = 10
+        if is_multifocal and need_addition:
+            # J&J Simplifit multifocal cylinder rules
+            if abs_cyl <= self.ASTIG_SPHERICAL_MF_MAX:
+                # Treat as spherical multifocal — sphere already is SE (set upstream
+                # by compute_cl_refraction_multifocal), no further adjustment needed.
+                need_cylinder_mf = False
+            elif abs_cyl <= self.ASTIG_TORIC_MF_LOW_MAX:
+                # Toric multifocal — no sphere adjustment
+                need_cylinder_mf = True
+                mf_sphere_adjustment = 0.0
+            elif abs_cyl <= self.ASTIG_TORIC_MF_HIGH_MAX:
+                # Toric multifocal + −0.25 D on sphere
+                need_cylinder_mf = True
+                mf_sphere_adjustment = -0.25
+                effective_sphere = cl_rx.sphere + mf_sphere_adjustment
+                warnings.append(
+                    f"High astigmatism ({cl_rx.cylinder:.2f} D): −0.25 D applied "
+                    f"to sphere for toric multifocal fit (J&J Simplifit rule)."
+                )
             else:
-                cyl_min, cyl_max = lens["cylinder_range"]  # negative values
-                if not (cyl_max <= cl_rx.cylinder <= cyl_min):
-                    return None  # astigmatisme outside toric range
-                cyl_score = 30
+                # Beyond Simplifit range — standard toric rules apply
+                need_cylinder_mf = True
         else:
-            if lens["cylinder_range"] is not None:
-                # Toric lens for a non-astigmatic patient: possible but suboptimal
-                cyl_score = 15
-                warnings.append("Toric lens available — patient is not astigmatic.")
-            else:
-                cyl_score = 30
+            need_cylinder_mf = False  # not relevant for non-MF path
 
-        # Test 3: addition
+        # For non-multifocal lenses (or multifocals where we use standard logic)
+        need_cylinder = abs_cyl >= self.ASTIG_THRESHOLD
+
+        sph_min, sph_max = lens["sphere_range"]
+        if not (sph_min <= effective_sphere <= sph_max):
+            return None
+
+        if is_multifocal and need_addition:
+            # Use Simplifit-derived cylinder need
+            if need_cylinder_mf:
+                if lens["cylinder_range"] is None:
+                    # Spherical lens for a patient needing toric multifocal
+                    if abs_cyl > self.ASTIG_TORIC_MF_HIGH_MAX:
+                        return None
+                    else:
+                        warnings.append(
+                            f"Toric multifocal preferred (Cyl {cl_rx.cylinder:.2f} D) "
+                            f"but this model has no toric version."
+                        )
+                        cyl_score = 10
+                else:
+                    cyl_min, cyl_max = lens["cylinder_range"]
+                    if not (cyl_max <= cl_rx.cylinder <= cyl_min):
+                        return None
+                    cyl_score = 30
+            else:
+                # Spherical multifocal path (cyl ≤ 0.75 D)
+                if lens["cylinder_range"] is not None:
+                    cyl_score = 15
+                    warnings.append("Toric multifocal available — patient astigmatism ≤ 0.75 D.")
+                else:
+                    cyl_score = 30
+        else:
+            # Standard (non-multifocal) cylinder logic
+            if need_cylinder:
+                if lens["cylinder_range"] is None:
+                    if abs_cyl >= 1.00:
+                        return None
+                    else:
+                        warnings.append(
+                            f"Astigmatism {cl_rx.cylinder:.2f} D uncorrected "
+                            f"(< 1.00 D, may be tolerated)."
+                        )
+                        cyl_score = 10
+                else:
+                    cyl_min, cyl_max = lens["cylinder_range"]
+                    if not (cyl_max <= cl_rx.cylinder <= cyl_min):
+                        return None
+                    cyl_score = 30
+            else:
+                if lens["cylinder_range"] is not None:
+                    cyl_score = 15
+                    warnings.append("Toric lens available — patient is not astigmatic.")
+                else:
+                    cyl_score = 30
+
         add_score = 0
         ordered_addition = None
         if need_addition:
             if lens.get("add_range") is None:
-                # No multifocal version -> exclude if addition >= 1.50 D
                 if cl_rx.addition >= 1.50:
                     return None
                 else:
@@ -183,11 +279,11 @@ class MatchingEngine:
                     ordered_addition = _format_addition(add_val, lens)
                 add_score = 10
 
-        # Sphere score: higher when power is well within range (not at limits)
+        # Sphere score
         sph_range_width = sph_max - sph_min
         sph_margin = min(
-            abs(cl_rx.sphere - sph_min),
-            abs(cl_rx.sphere - sph_max)
+            abs(effective_sphere - sph_min),
+            abs(effective_sphere - sph_max)
         )
         sph_score = 40 * min(1.0, sph_margin / (sph_range_width / 4 + 0.01))
 
@@ -204,10 +300,12 @@ class MatchingEngine:
 
         # Round powers to manufacturing steps
         sph_step = lens.get("sphere_steps", 0.25)
-        ordered_sph = _round_to_step(cl_rx.sphere, sph_step)
-        ordered_sph = max(sph_min, min(sph_max, ordered_sph))  # clamp to range
+        ordered_sph = _round_to_step(effective_sphere, sph_step)
+        ordered_sph = max(sph_min, min(sph_max, ordered_sph))
 
-        if need_cylinder and lens["cylinder_range"] is not None:
+        # Cylinder for toric path
+        active_cyl_need = need_cylinder_mf if (is_multifocal and need_addition) else need_cylinder
+        if active_cyl_need and lens["cylinder_range"] is not None:
             cyl_step = lens.get("cylinder_steps", 0.50)
             ordered_cyl = _round_to_step(cl_rx.cylinder, cyl_step)
             cyl_min_v, cyl_max_v = lens["cylinder_range"]
@@ -220,7 +318,6 @@ class MatchingEngine:
         # Total score
         total_score = sph_score + cyl_score + bc_score + add_score
 
-        # Dk/t bonus: favour high-oxygen-transmissibility lenses
         if lens["dk_t"] >= 140:
             total_score = min(100, total_score + 3)
         elif lens["dk_t"] >= 100:
@@ -239,11 +336,11 @@ class MatchingEngine:
             ordered_addition=ordered_addition,
             warnings=warnings,
             fit_notes=fit_notes,
+            lars_corrected_axis=None,  # populated externally after trial lens assessment
         )
 
 
 # Private helpers
-
 def _round_to_step(value: float, step: float) -> float:
     return round(value / step) * step
 
