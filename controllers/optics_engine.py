@@ -114,10 +114,51 @@ def _round_to_step(value: float, step: float) -> float:
     return round(value / step) * step
 
 
+def _round_up_to_step(value: float, step: float) -> float:
+    """
+    Round a value UP to the next manufacturing step (ceiling rounding).
+    """
+    return math.ceil(value / step - 1e-9) * step
+
+
+def _round_down_to_step_abs(value: float, step: float) -> float:
+    """
+    Round a cylinder value toward zero (i.e. less minus) to the nearest step.
+    Applied on the absolute value, then sign restored.
+    """
+    sign = -1.0 if value < 0 else 1.0
+    abs_val = abs(value)
+    rounded_abs = math.floor(abs_val / step + 1e-9) * step
+    return sign * rounded_abs
+
+
 def _normalize_cylinder_axis(axis: int) -> int:
     """Clamp axis to [1, 180]."""
     axis = axis % 180
     return axis if axis > 0 else 180
+
+
+def _round_axis_alcon(axis: int, step: int = 10) -> int:
+    """
+    Round axis to the nearest manufacturing step with the Alcon FittingHub rule:
+    - Remainder ≤ 5° → round DOWN to the lower step,
+      but if that would give 0° → use 180° instead.
+    - Remainder > 5° → round UP to the higher step.
+
+    Reference: Alcon FittingHub prescribing guide, 2023.
+    """
+    remainder = axis % step
+    if remainder <= 5:
+        rounded = axis - remainder
+    else:
+        rounded = axis + (step - remainder)
+
+    # Clamp to [1, 180]
+    if rounded <= 0:
+        rounded = 180
+    if rounded > 180:
+        rounded = rounded % 180 or 180
+    return rounded
 
 
 # Main computation engine
@@ -127,6 +168,12 @@ class OpticsEngine:
     Computes contact lens refraction from spectacle refraction by applying
     vertex distance compensation meridian by meridian (exact method),
     then converts to standard sphere/cylinder/axis form.
+
+    Rounding rules are aligned with Alcon FittingHub (2023):
+      - Sphere:   round UP to 0.25 D step
+      - Cylinder: round toward zero (less minus) to 0.25 D step
+      - Axis:     10° steps; remainder ≤ 5° → round down (→ 180° if result is 0)
+      - Addition: round UP to 0.25 D step
     """
 
     def compute_cl_refraction(self, rx: SpectacleRx) -> CLRx:
@@ -137,16 +184,14 @@ class OpticsEngine:
           1. Decompose refraction into two meridional powers.
           2. Apply vertex compensation to each meridian.
           3. Recompose into sphere/cylinder/axis.
+          4. Apply Alcon FittingHub rounding rules.
         """
-        # 1. Meridional powers at the spectacle plane
         f_sphere = rx.sphere
         f_cylinder = rx.cylinder if rx.cylinder else 0.0
-        axis_rad = math.radians(rx.axis)
 
-        f_meridian_1 = f_sphere               # meridian perpendicular to cylinder (= sphere)
-        f_meridian_2 = f_sphere + f_cylinder  # meridian of cylinder
+        f_meridian_1 = f_sphere
+        f_meridian_2 = f_sphere + f_cylinder
 
-        # 2. Vertex compensation per meridian
         d = rx.vertex_distance
 
         # Apply compensation only when |F| > 4 D (clinically significant)
@@ -160,13 +205,11 @@ class OpticsEngine:
         else:
             f2_cl = f_meridian_2
 
-        # 3. Recompose into sphere/cylinder form
         sph_cl = f1_cl
         cyl_cl = f2_cl - f1_cl
 
-        # Clinical rounding: 0.25 D step for sphere
-        sph_cl = _round_to_step(sph_cl, 0.25)
-        cyl_cl = _round_to_step(cyl_cl, 0.25)
+        sph_cl = _round_up_to_step(sph_cl, 0.25)
+        cyl_cl = _round_down_to_step_abs(cyl_cl, 0.25)
 
         # Enforce minus-cylinder convention
         if cyl_cl > 0:
@@ -180,8 +223,12 @@ class OpticsEngine:
         if abs(cyl_cl) < 0.25:
             cyl_cl = 0.0
             rx_axis = 0
+        else:
+            # Axis: Alcon FittingHub 10° step with ≤5° → round down / 180° rule
+            rx_axis = _round_axis_alcon(rx_axis, step=10)
 
-        add = rx.addition if rx.addition else 0.0
+        # Addition: round UP to 0.25 D
+        add = _round_up_to_step(rx.addition, 0.25) if rx.addition else 0.0
 
         return CLRx(
             sphere=sph_cl,
@@ -190,6 +237,39 @@ class OpticsEngine:
             addition=add,
             vertex_distance=0.0,
         )
+
+    def compute_cl_refraction_multifocal(self, rx: SpectacleRx) -> CLRx:
+        """
+        Variant for multifocal fitting: uses the spherical equivalent as the
+        starting sphere power before vertex compensation, then applies the
+        same Alcon FittingHub rounding rules.
+
+        Reference: B+L ULTRA for Presbyopia fitting guide (2022);
+                   J&J Simplifit multifocal protocol (2023).
+        """
+        se = self.compute_spherical_equivalent(rx.sphere, rx.cylinder if rx.cylinder else 0.0)
+
+        # Build a spherical-only Rx at the spherical equivalent
+        rx_se = SpectacleRx(
+            sphere=se,
+            cylinder=0.0,
+            axis=0,
+            addition=rx.addition,
+            vertex_distance=rx.vertex_distance,
+        )
+        return self.compute_cl_refraction(rx_se)
+
+    @staticmethod
+    def compute_spherical_equivalent(sphere: float, cylinder: float) -> float:
+        """
+        Spherical equivalent: SE = sphere + cylinder / 2.
+
+        Used as the starting sphere for multifocal lens fitting to account
+        for the fact that multifocal designs do not correct astigmatism.
+
+        Reference: B+L ULTRA for Presbyopia fitting guide (2022).
+        """
+        return sphere + cylinder / 2.0
 
     def estimate_sagittal_depth(self, r_mm: float, diameter_mm: float) -> float:
         """
