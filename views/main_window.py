@@ -5,10 +5,22 @@ Main graphical interface — Contact lens fitting assistant.
 MVC architecture:
   - This module contains only the view (PyQt5).
   - All business logic is delegated to the controllers.
+
+Changes vs v1.0:
+  - [P0] Bug fix: compute_cl_refraction_multifocal() now called for presbyopic patients.
+  - [P0] Bug fix: axis QSpinBox minimum set to 1 (optometric convention 1–180).
+  - [P1] Interface LARS: drift input + "Correct Axis" button in the notes panel.
+  - [P1] Brands derived dynamically from LENS_DATABASE (no hard-coded list).
+  - [P1] Keratometry displayed in diopters (K1, K2, Km, corneal Ast) live.
+  - [P2] Keratometry clinical warnings (K > 48 D → keratoconus suspicion).
+  - [P2] "Copy Prescription" button to clipboard.
+  - [P2] Informative empty-result messages (explains which filter rejected).
+  - [P2] BC fitting rule selector (ortho-K support).
+  - [P2] UI constants sourced from config.py.
 """
 
 import sys
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -19,6 +31,13 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon
+
+from config import (
+    UI_MIN_WIDTH, UI_MIN_HEIGHT, UI_DEFAULT_WIDTH, UI_DEFAULT_HEIGHT,
+    UI_LEFT_PANEL_MAX_WIDTH, UI_SPLITTER_LEFT, UI_SPLITTER_RIGHT,
+    UI_NOTES_MAX_HEIGHT,
+    KERATO_SUSPECT_THRESHOLD_D, KERO_R_MIN_MM, KERO_R_MAX_MM,
+)
 
 # Color palette
 COLOR_BG        = "#1E2330"
@@ -32,6 +51,8 @@ COLOR_TEXT_DIM  = "#8899AA"
 COLOR_BORDER    = "#3A4460"
 COLOR_ROW_ALT   = "#2A3347"
 COLOR_ROW_SEL   = "#2D4A7A"
+COLOR_OD        = "#FF6B6B"   # soft red for right eye header
+COLOR_OS        = "#6BCB77"   # soft green for left eye header
 
 STYLESHEET = f"""
 /* Window & background */
@@ -77,6 +98,11 @@ QLabel#titleLabel {{
 QLabel#subtitleLabel {{
     color: {COLOR_TEXT_DIM};
     font-size: 12px;
+}}
+QLabel#kDioptersLabel {{
+    color: {COLOR_ACCENT2};
+    font-size: 11px;
+    font-style: italic;
 }}
 
 /* SpinBox */
@@ -145,6 +171,24 @@ QPushButton#btnReset {{
 QPushButton#btnReset:hover {{
     color: {COLOR_TEXT};
     border-color: {COLOR_TEXT_DIM};
+}}
+
+/* LARS / copy button */
+QPushButton#btnSecondary {{
+    background-color: transparent;
+    color: {COLOR_ACCENT};
+    border: 1px solid {COLOR_ACCENT};
+    border-radius: 6px;
+    padding: 5px 14px;
+    font-size: 12px;
+}}
+QPushButton#btnSecondary:hover {{
+    background-color: {COLOR_ACCENT};
+    color: white;
+}}
+QPushButton#btnSecondary:pressed {{
+    background-color: #2D65CC;
+    color: white;
 }}
 
 /* Table */
@@ -242,25 +286,42 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
 }}
 """
 
+# Column tooltips for the result table
+COLUMN_TOOLTIPS = {
+    "Score":  "Compatibility score (0–100). Sphere 40 pts · Cylinder 30 pts · BC 20 pts · Addition 10 pts.",
+    "Brand":  "Manufacturer brand.",
+    "Model":  "Lens model name.",
+    "Type":   "Wear modality: daily / monthly / biweekly / orthokeratology.",
+    "Sph":    "Ordered sphere power at the corneal plane (diopters).",
+    "Cyl":    "Ordered cylinder power, minus-cylinder convention (diopters). '—' = spherical.",
+    "Axis":   "Ordered cylinder axis (degrees, 1–180). '—' = spherical.",
+    "BC":     "Base Curve — radius of curvature of the posterior lens surface (mm). Derived from keratometry.",
+    "Dia":    "Overall lens diameter (mm).",
+    "Add":    "Ordered addition power for multifocal lenses. Includes manufacturer designation where available.",
+}
+
 
 # Main window
 
 class MainWindow(QMainWindow):
     """Main window of the contact lens fitting assistant."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LensAdvisor — Contact Lens Fitting Assistant")
-        self.setMinimumSize(1200, 750)
-        self.resize(1350, 820)
+        self.setMinimumSize(UI_MIN_WIDTH, UI_MIN_HEIGHT)
+        self.resize(UI_DEFAULT_WIDTH, UI_DEFAULT_HEIGHT)
         self.setStyleSheet(STYLESHEET)
 
-        # Late import to avoid circular imports
+        # Late import to avoid circular imports at module load time
         from controllers.optics_engine import OpticsEngine, SpectacleRx, Keratometry
         from controllers.matching_engine import MatchingEngine
 
         self._optics = OpticsEngine()
         self._matching = MatchingEngine()
+
+        # Stores the last computed candidates per eye for LARS correction
+        self._last_candidates: Dict[str, list] = {"od": [], "os": []}
 
         self._build_ui()
         self._connect_signals()
@@ -268,30 +329,28 @@ class MainWindow(QMainWindow):
 
     # UI construction
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
+        """Assemble the full window layout."""
         central = QWidget()
         self.setCentralWidget(central)
+
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(16, 12, 16, 8)
         root_layout.setSpacing(10)
 
         root_layout.addWidget(self._build_header())
 
-        sep = QFrame()
-        sep.setObjectName("hRule")
-        sep.setFrameShape(QFrame.HLine)
-        root_layout.addWidget(sep)
-
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([420, 900])
+        splitter.setSizes([UI_SPLITTER_LEFT, UI_SPLITTER_RIGHT])
         root_layout.addWidget(splitter, stretch=1)
 
         self.statusBar().setVisible(True)
 
     def _build_header(self) -> QWidget:
+        """Application title bar."""
         w = QWidget()
         lay = QHBoxLayout(w)
         lay.setContentsMargins(4, 0, 4, 0)
@@ -301,7 +360,7 @@ class MainWindow(QMainWindow):
         lbl_sub = QLabel("Contact Lens Fitting Assistant — Clinical use for orthoptists")
         lbl_sub.setObjectName("subtitleLabel")
 
-        lbl_version = QLabel("v1.0")
+        lbl_version = QLabel("v2.0")
         lbl_version.setObjectName("dimLabel")
         lbl_version.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -312,9 +371,9 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_left_panel(self) -> QWidget:
-        """Left panel: patient data entry."""
+        """Left panel: all patient data entry fields and filters."""
         w = QWidget()
-        w.setMaximumWidth(440)
+        w.setMaximumWidth(UI_LEFT_PANEL_MAX_WIDTH)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 8, 0)
         lay.setSpacing(10)
@@ -327,6 +386,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_refraction_group(self) -> QGroupBox:
+        """Spectacle refraction input grid (OD / OS)."""
         grp = QGroupBox("Spectacle Refraction")
         grid = QGridLayout(grp)
         grid.setHorizontalSpacing(10)
@@ -335,13 +395,23 @@ class MainWindow(QMainWindow):
         for col, txt in enumerate(["Parameter", "RE (right)", "LE (left)"]):
             lbl = QLabel(txt)
             lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px; font-weight: bold;")
+            lbl.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 11px; font-weight: bold;"
+            )
             grid.addWidget(lbl, 0, col)
+
+        # Column headers with OD/OS colour coding
+        grid.itemAtPosition(0, 1).widget().setStyleSheet(
+            f"color: {COLOR_OD}; font-size: 11px; font-weight: bold;"
+        )
+        grid.itemAtPosition(0, 2).widget().setStyleSheet(
+            f"color: {COLOR_OS}; font-size: 11px; font-weight: bold;"
+        )
 
         rows = [
             ("Sphere (D)",    "sph",  -25.00, +25.00, 0.25, "D"),
             ("Cylinder (D)",  "cyl",  -10.00,   0.00, 0.25, "D"),
-            ("Axis (deg)",    "axis",     0,    180,    1,   "deg"),
+            ("Axis (°)",      "axis",      1,    180,    1,  "°"),
             ("Addition (D)",  "add",   0.00,   4.00,  0.25, "D"),
         ]
 
@@ -353,9 +423,10 @@ class MainWindow(QMainWindow):
                 w_key = f"{key}_{eye}"
                 if key == "axis":
                     spin = QSpinBox()
-                    spin.setRange(int(mn), int(mx))
+                    spin.setRange(int(mn), int(mx))  # 1–180, convention optométrique
                     spin.setSuffix(f" {unit}")
-                    spin.setValue(0)
+                    spin.setValue(90)
+                    spin.setToolTip("Cylinder axis — optometric convention: 1° to 180°.")
                 else:
                     spin = QDoubleSpinBox()
                     spin.setRange(mn, mx)
@@ -375,25 +446,38 @@ class MainWindow(QMainWindow):
         self._vertex_spin.setSingleStep(0.5)
         self._vertex_spin.setDecimals(1)
         self._vertex_spin.setSuffix(" mm")
+        self._vertex_spin.setToolTip(
+            "Distance from the back of the spectacle lens to the corneal apex (default 12 mm)."
+        )
         grid.addWidget(self._vertex_spin, len(rows) + 1, 1, 1, 2)
 
         return grp
 
     def _build_keratometry_group(self) -> QGroupBox:
+        """Keratometry inputs with live dioptre display and clinical warnings."""
         grp = QGroupBox("Keratometry")
         grid = QGridLayout(grp)
         grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
+        grid.setVerticalSpacing(6)
 
         for col, txt in enumerate(["Parameter", "RE (right)", "LE (left)"]):
             lbl = QLabel(txt)
             lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px; font-weight: bold;")
+            lbl.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 11px; font-weight: bold;"
+            )
             grid.addWidget(lbl, 0, col)
 
+        grid.itemAtPosition(0, 1).widget().setStyleSheet(
+            f"color: {COLOR_OD}; font-size: 11px; font-weight: bold;"
+        )
+        grid.itemAtPosition(0, 2).widget().setStyleSheet(
+            f"color: {COLOR_OS}; font-size: 11px; font-weight: bold;"
+        )
+
         kero_rows = [
-            ("R1 — flat meridian (mm)", "r1", 6.50, 9.50, 0.01),
-            ("R2 — steep meridian (mm)", "r2", 6.50, 9.50, 0.01),
+            ("R1 — flat meridian (mm)", "r1", KERO_R_MIN_MM, KERO_R_MAX_MM, 0.01),
+            ("R2 — steep meridian (mm)", "r2", KERO_R_MIN_MM, KERO_R_MAX_MM, 0.01),
         ]
 
         for r, (label, key, mn, mx, step) in enumerate(kero_rows, start=1):
@@ -407,32 +491,75 @@ class MainWindow(QMainWindow):
                 spin.setSuffix(" mm")
                 spin.setValue(7.80 if key == "r1" else 7.60)
                 spin.setMinimumWidth(120)
+                spin.setToolTip(
+                    "Flat meridian (K1): largest radius — smallest power.\n"
+                    "Steep meridian (K2): smallest radius — largest power.\n"
+                    f"Physiological range: {mn:.2f}–{mx:.2f} mm."
+                )
                 self._inputs[w_key] = spin
                 col = 1 if eye == "od" else 2
                 grid.addWidget(spin, r, col)
+                # Connect live update
+                spin.valueChanged.connect(self._update_kero_display)
 
-        hint = QLabel("R1 >= R2  (flat meridian always has the larger radius)")
+        hint = QLabel("R1 ≥ R2  (flat meridian → larger radius)")
         hint.setObjectName("dimLabel")
         hint.setWordWrap(True)
         grid.addWidget(hint, 3, 0, 1, 3)
 
+        # Live K dioptre labels — one per eye
+        self._lbl_k_od = QLabel("")
+        self._lbl_k_od.setObjectName("kDioptersLabel")
+        self._lbl_k_od.setWordWrap(True)
+        self._lbl_k_os = QLabel("")
+        self._lbl_k_os.setObjectName("kDioptersLabel")
+        self._lbl_k_os.setWordWrap(True)
+        grid.addWidget(self._lbl_k_od, 4, 1)
+        grid.addWidget(self._lbl_k_os, 4, 2)
+
+        # Trigger initial display
+        self._update_kero_display()
+
         return grp
 
     def _build_filters_group(self) -> QGroupBox:
+        """Search filters: wear type, brands (dynamic), result count, BC rule."""
         grp = QGroupBox("Search Filters")
         lay = QVBoxLayout(grp)
         lay.setSpacing(8)
 
+        # Wear type
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Wear type:"))
         self._combo_type = QComboBox()
         self._combo_type.addItems(["All", "daily", "monthly", "biweekly", "orthokeratology"])
+        self._combo_type.setToolTip("Filter by lens replacement modality.")
         row1.addWidget(self._combo_type, stretch=1)
         lay.addLayout(row1)
 
+        # BC fitting rule
+        row_bc = QHBoxLayout()
+        row_bc.addWidget(QLabel("BC rule:"))
+        self._combo_bc_rule = QComboBox()
+        self._combo_bc_rule.addItems([
+            "flat_k_plus_offset",
+            "mean_k",
+            "ortho_k_flat_k",
+        ])
+        self._combo_bc_rule.setToolTip(
+            "Base curve recommendation rule:\n"
+            "• flat_k_plus_offset: BC = flat_K + 0.10 mm (standard SCL)\n"
+            "• mean_k: BC = mean radius\n"
+            "• ortho_k_flat_k: BC = flat_K + 0.50 mm (initial ortho-K)"
+        )
+        row_bc.addWidget(self._combo_bc_rule, stretch=1)
+        lay.addLayout(row_bc)
+
+        # Brands — derived dynamically from the database
         lay.addWidget(QLabel("Brands:"))
-        brands = ["CooperVision", "Alcon", "Bausch + Lomb", "Johnson & Johnson", "FitBetter"]
-        self._brand_checks = {}
+        from data.lens_database import LENS_DATABASE
+        brands = sorted({lens["brand"] for lens in LENS_DATABASE})
+        self._brand_checks: Dict[str, QCheckBox] = {}
         brand_grid = QGridLayout()
         brand_grid.setHorizontalSpacing(6)
         brand_grid.setVerticalSpacing(4)
@@ -443,6 +570,7 @@ class MainWindow(QMainWindow):
             brand_grid.addWidget(cb, i // 2, i % 2)
         lay.addLayout(brand_grid)
 
+        # Number of results
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Number of results:"))
         self._spin_top_n = QSpinBox()
@@ -455,6 +583,7 @@ class MainWindow(QMainWindow):
         return grp
 
     def _build_buttons(self) -> QWidget:
+        """Calculate and Reset buttons."""
         w = QWidget()
         lay = QHBoxLayout(w)
         lay.setContentsMargins(0, 4, 0, 0)
@@ -463,17 +592,19 @@ class MainWindow(QMainWindow):
         self._btn_calc = QPushButton("Calculate & Recommend")
         self._btn_calc.setObjectName("btnCalculate")
         self._btn_calc.setCursor(Qt.PointingHandCursor)
+        self._btn_calc.setToolTip("Run the matching engine for both eyes (F5).")
 
         self._btn_reset = QPushButton("Reset")
         self._btn_reset.setObjectName("btnReset")
         self._btn_reset.setCursor(Qt.PointingHandCursor)
+        self._btn_reset.setToolTip("Clear all fields (Ctrl+R).")
 
         lay.addWidget(self._btn_calc, stretch=3)
         lay.addWidget(self._btn_reset, stretch=1)
         return w
 
     def _build_right_panel(self) -> QWidget:
-        """Right panel: results."""
+        """Right panel: converted refraction, result tables, notes, LARS, copy."""
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 0, 0, 0)
@@ -487,7 +618,10 @@ class MainWindow(QMainWindow):
         for eye, label in [("od", "Right Eye"), ("os", "Left Eye")]:
             sub = QVBoxLayout()
             lbl_head = QLabel(label)
-            lbl_head.setStyleSheet(f"color: {COLOR_ACCENT}; font-weight: bold; font-size: 13px;")
+            head_color = COLOR_OD if eye == "od" else COLOR_OS
+            lbl_head.setStyleSheet(
+                f"color: {head_color}; font-weight: bold; font-size: 13px;"
+            )
             sub.addWidget(lbl_head)
             lbl_val = QLabel("—")
             lbl_val.setStyleSheet("font-size: 15px; color: white; font-weight: bold;")
@@ -503,26 +637,78 @@ class MainWindow(QMainWindow):
         tabs_lay = QHBoxLayout(tabs_widget)
         tabs_lay.setSpacing(8)
 
-        self._tbl_od = self._make_result_table("RE — Right Eye")
-        self._tbl_os = self._make_result_table("LE — Left Eye")
+        self._tbl_od = self._make_result_table("RE — Right Eye", "od")
+        self._tbl_os = self._make_result_table("LE — Left Eye", "os")
         tabs_lay.addWidget(self._tbl_od[0])
         tabs_lay.addWidget(self._tbl_os[0])
         lay.addWidget(tabs_widget, stretch=1)
 
-        # Warnings / notes area
+        # Notes area
         self._grp_notes = QGroupBox("Warnings & Clinical Notes")
         notes_lay = QVBoxLayout(self._grp_notes)
         self._txt_notes = QTextEdit()
         self._txt_notes.setReadOnly(True)
-        self._txt_notes.setMaximumHeight(140)
-        self._txt_notes.setPlaceholderText("Clinical warnings will appear here after calculation...")
+        self._txt_notes.setMaximumHeight(UI_NOTES_MAX_HEIGHT)
+        self._txt_notes.setPlaceholderText(
+            "Clinical warnings will appear here after calculation..."
+        )
         notes_lay.addWidget(self._txt_notes)
+
+        # Action row: LARS correction + Copy prescription
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+
+        lars_lbl = QLabel("Trial lens drift:")
+        lars_lbl.setObjectName("dimLabel")
+        action_row.addWidget(lars_lbl)
+
+        self._lars_spin = QSpinBox()
+        self._lars_spin.setRange(-45, 45)
+        self._lars_spin.setValue(0)
+        self._lars_spin.setSuffix("°")
+        self._lars_spin.setToolTip(
+            "LARS rule — observed rotation of the trial toric lens:\n"
+            " + = drift to the LEFT  (add to axis)\n"
+            " − = drift to the RIGHT (subtract from axis)\n"
+            "Reference: Gasson & Morris, Contact Lens Manual 4th ed. (2010)."
+        )
+        self._lars_spin.setMinimumWidth(80)
+        action_row.addWidget(self._lars_spin)
+
+        self._btn_lars = QPushButton("Correct Axis (LARS)")
+        self._btn_lars.setObjectName("btnSecondary")
+        self._btn_lars.setCursor(Qt.PointingHandCursor)
+        self._btn_lars.setToolTip(
+            "Apply LARS correction to the axis of the selected toric lens candidate."
+        )
+        action_row.addWidget(self._btn_lars)
+
+        action_row.addStretch()
+
+        self._btn_copy = QPushButton("Copy Prescription")
+        self._btn_copy.setObjectName("btnSecondary")
+        self._btn_copy.setCursor(Qt.PointingHandCursor)
+        self._btn_copy.setToolTip(
+            "Copy the selected lens prescription to the clipboard."
+        )
+        action_row.addWidget(self._btn_copy)
+
+        notes_lay.addLayout(action_row)
         lay.addWidget(self._grp_notes)
 
         return w
 
-    def _make_result_table(self, title: str):
-        """Create a GroupBox containing a result table."""
+    def _make_result_table(self, title: str, eye: str):
+        """
+        Create a GroupBox containing a result table.
+
+        Args:
+            title: display title for the GroupBox
+            eye:   "od" or "os" — used to bind the selection signal
+
+        Returns:
+            Tuple (QGroupBox, QTableWidget)
+        """
         grp = QGroupBox(f"Candidates — {title}")
         lay = QVBoxLayout(grp)
         lay.setContentsMargins(6, 6, 6, 6)
@@ -539,6 +725,12 @@ class MainWindow(QMainWindow):
         tbl.setColumnCount(len(columns))
         tbl.setHorizontalHeaderLabels(columns)
 
+        # Tooltips on column headers
+        for i, col_name in enumerate(columns):
+            tbl.horizontalHeaderItem(i).setToolTip(
+                COLUMN_TOOLTIPS.get(col_name, col_name)
+            )
+
         widths = [55, 120, 160, 90, 60, 55, 50, 50, 45, 70]
         for i, w in enumerate(widths):
             tbl.setColumnWidth(i, w)
@@ -547,24 +739,76 @@ class MainWindow(QMainWindow):
         tbl.setMinimumHeight(200)
 
         tbl.itemSelectionChanged.connect(
-            lambda t=tbl, eye=title: self._on_row_selected(t, eye)
+            lambda t=tbl, e=eye: self._on_row_selected(t, e)
         )
 
         lay.addWidget(tbl)
         return grp, tbl
 
-    # Signals
+    # Signal connections
 
-    def _connect_signals(self):
+    def _connect_signals(self) -> None:
+        """Wire all interactive signals to their slots."""
         self._btn_calc.clicked.connect(self._on_calculate)
         self._btn_reset.clicked.connect(self._on_reset)
+        self._btn_lars.clicked.connect(self._on_apply_lars)
+        self._btn_copy.clicked.connect(self._on_copy_prescription)
 
-    # Slots
+        # Keyboard shortcuts
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        QShortcut(QKeySequence("F5"), self).activated.connect(self._on_calculate)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._on_reset)
+        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self._on_copy_prescription)
 
-    def _on_calculate(self):
+    # Live keratometry display
+
+    def _update_kero_display(self) -> None:
+        """
+        Recalculate and display K1, K2, Km, corneal astigmatism in diopters
+        whenever any keratometry spin changes.  Also emits clinical warnings
+        for out-of-range values.
+        """
+        from controllers.optics_engine import Keratometry
+
+        for eye, lbl in [("od", self._lbl_k_od), ("os", self._lbl_k_os)]:
+            r1 = self._inputs[f"k_r1_{eye}"].value()
+            r2 = self._inputs[f"k_r2_{eye}"].value()
+
+            # Swap silently for display purposes (do not mutate spinboxes here)
+            flat_r = max(r1, r2)
+            steep_r = min(r1, r2)
+
+            try:
+                kero = Keratometry(r1=flat_r, r2=steep_r)
+                k1 = kero.k1_diopters
+                k2 = kero.k2_diopters
+                km = kero.km_diopters
+                ast = kero.corneal_astigmatism_diopters
+
+                warnings = []
+                if k1 >= KERATO_SUSPECT_THRESHOLD_D or k2 >= KERATO_SUSPECT_THRESHOLD_D:
+                    warnings.append("⚠ K > 48 D — suspect keratoconus")
+
+                warn_str = f"  {warnings[0]}" if warnings else ""
+                lbl.setText(
+                    f"K1 {k1:.2f} D · K2 {k2:.2f} D · Km {km:.2f} D · "
+                    f"Ast {ast:.2f} D{warn_str}"
+                )
+                if warnings:
+                    lbl.setStyleSheet(f"color: {COLOR_WARNING}; font-size: 11px; font-style: italic;")
+                else:
+                    lbl.setStyleSheet(f"color: {COLOR_ACCENT2}; font-size: 11px; font-style: italic;")
+            except Exception:
+                lbl.setText("")
+
+    # Main calculation slot
+
+    def _on_calculate(self) -> None:
         """Trigger computation for both eyes."""
         self._txt_notes.clear()
         self._clear_tables()
+        self._last_candidates = {"od": [], "os": []}
 
         from controllers.optics_engine import SpectacleRx, Keratometry
 
@@ -590,56 +834,117 @@ class MainWindow(QMainWindow):
                     r1, r2 = r2, r1
 
                 kero = Keratometry(r1=r1, r2=r2)
-
                 self._compute_eye(eye, rx, kero)
 
+            except ValueError as exc:
+                errors.append(f"Input error {eye.upper()}: {exc}")
             except Exception as exc:
-                errors.append(f"Error {eye.upper()}: {exc}")
+                errors.append(f"Unexpected error {eye.upper()}: {exc}")
 
         if errors:
             self._append_note("\n".join(errors), color=COLOR_WARNING)
 
-        self._set_status("Calculation complete — Click a lens to view details.")
+        self._set_status("Calculation complete — Click a lens row to view details.")
 
-    def _compute_eye(self, eye: str, rx, kero):
-        """Compute CL refraction and run matching for one eye."""
-        # 1. Vertex conversion
-        cl_rx = self._optics.compute_cl_refraction(rx)
+    def _compute_eye(self, eye: str, rx, kero) -> None:
+        """
+        Compute CL refraction and run matching for one eye.
+
+        Key fix (v2.0): uses compute_cl_refraction_multifocal() for presbyopic
+        patients (addition > 0), which starts from the spherical equivalent.
+        """
+        from controllers.optics_engine import SpectacleRx
+
+        # [P0 FIX] Route to the correct computation method
+        if rx.addition > 0.0:
+            cl_rx = self._optics.compute_cl_refraction_multifocal(rx)
+        else:
+            cl_rx = self._optics.compute_cl_refraction(rx)
 
         lbl = getattr(self, f"_lbl_lc_{eye}")
         lbl.setText(str(cl_rx))
 
-        # 2. Filters
+        # Filters
         type_filter = self._combo_type.currentText()
         if type_filter == "All":
             type_filter = None
 
         brands = [b for b, cb in self._brand_checks.items() if cb.isChecked()]
         if len(brands) == len(self._brand_checks):
-            brands = None  # all brands selected = no filter
+            brands = None  # all brands → no filter
 
         top_n = self._spin_top_n.value()
+        bc_rule = self._combo_bc_rule.currentText()
 
-        # 3. Matching
+        # Matching
         candidates = self._matching.find_candidates(
             cl_rx=cl_rx,
             kero=kero,
             lens_type_filter=type_filter,
             brand_filter=brands,
             top_n=top_n,
+            bc_fitting_rule=bc_rule,
         )
 
-        # 4. Populate table
+        self._last_candidates[eye] = candidates
+
+        # Populate table
         tbl = self._tbl_od[1] if eye == "od" else self._tbl_os[1]
         self._populate_table(tbl, candidates)
 
         if not candidates:
+            reason = self._explain_empty_results(cl_rx, type_filter, brands)
             self._append_note(
-                f"{eye.upper()}: No compatible lens found with current filters.",
+                f"{eye.upper()}: No compatible lens found. {reason}",
                 color=COLOR_WARNING,
             )
 
-    def _populate_table(self, tbl: QTableWidget, candidates):
+    def _explain_empty_results(
+        self,
+        cl_rx,
+        type_filter: Optional[str],
+        brands: Optional[List[str]],
+    ) -> str:
+        """
+        Generate a human-readable explanation for why no candidates were found.
+        Checks sphere range, cylinder range, and active filters.
+        """
+        from data.lens_database import LENS_DATABASE
+
+        reasons = []
+
+        # Check if sphere is out of all lenses in the DB
+        any_sph = any(
+            lens["sphere_range"][0] <= cl_rx.sphere <= lens["sphere_range"][1]
+            for lens in LENS_DATABASE
+        )
+        if not any_sph:
+            reasons.append(
+                f"Sphere {cl_rx.sphere:+.2f} D is outside all available lens ranges."
+            )
+
+        # Check if cylinder is out of all toric lenses
+        if abs(cl_rx.cylinder) >= 1.0:
+            any_cyl = any(
+                lens["cylinder_range"] is not None and
+                lens["cylinder_range"][1] <= cl_rx.cylinder <= lens["cylinder_range"][0]
+                for lens in LENS_DATABASE
+            )
+            if not any_cyl:
+                reasons.append(
+                    f"Cylinder {cl_rx.cylinder:+.2f} D exceeds all toric ranges."
+                )
+
+        if type_filter:
+            reasons.append(f"Wear type filter is active: '{type_filter}'.")
+        if brands:
+            reasons.append(f"Brand filter active: {', '.join(brands)}.")
+
+        return " ".join(reasons) if reasons else "Check filters or extend prescription range."
+
+    # Table population and row selection
+
+    def _populate_table(self, tbl: QTableWidget, candidates) -> None:
         """Populate a result table with the candidate list."""
         tbl.setRowCount(len(candidates))
 
@@ -658,15 +963,26 @@ class MainWindow(QMainWindow):
             cyl_str = (
                 f"{c.ordered_cylinder:+.2f}" if c.ordered_cylinder != 0.0 else "—"
             )
-            axis_str = (
-                f"{c.ordered_axis}deg" if c.ordered_cylinder != 0.0 else "—"
+            # Show LARS-corrected axis if available, else standard axis
+            displayed_axis = (
+                c.lars_corrected_axis
+                if c.lars_corrected_axis is not None
+                else c.ordered_axis
             )
+            axis_str = f"{displayed_axis}°" if c.ordered_cylinder != 0.0 else "—"
+            if c.lars_corrected_axis is not None and c.ordered_cylinder != 0.0:
+                axis_str += " ✓"  # visual indicator that LARS was applied
+
             add_str = c.ordered_addition if c.ordered_addition else "—"
+
+            # Dk/t badge
+            dkt_badge = " ★" if c.dk_t >= 140 else ""
+            model_str = c.model + dkt_badge
 
             values = [
                 score_item,
                 c.brand,
-                c.model,
+                model_str,
                 c.lens_type,
                 f"{c.ordered_sphere:+.2f}",
                 cyl_str,
@@ -684,10 +1000,11 @@ class MainWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignCenter)
                 tbl.setItem(row, col, item)
 
+            # Store candidate object on the score item for later retrieval
             tbl.item(row, 0).setData(Qt.UserRole, c)
 
-    def _on_row_selected(self, tbl: QTableWidget, eye_label: str):
-        """Display warnings for the selected lens."""
+    def _on_row_selected(self, tbl: QTableWidget, eye: str) -> None:
+        """Display detailed warnings and prescription for the selected lens row."""
         sel = tbl.selectedItems()
         if not sel:
             return
@@ -701,60 +1018,215 @@ class MainWindow(QMainWindow):
             return
 
         self._txt_notes.clear()
-        header = f"<b>{candidate.brand} — {candidate.model}</b> | Score: {candidate.score:.0f}%<br>"
+        eye_label = "Right Eye (OD)" if eye == "od" else "Left Eye (OS)"
+        header = (
+            f"<b>{candidate.brand} — {candidate.model}</b> "
+            f"| {eye_label} | Score: {candidate.score:.0f}%<br>"
+        )
         self._txt_notes.append(header)
 
         if candidate.warnings:
             for w in candidate.warnings:
-                self._txt_notes.append(f"Warning: {w}")
+                self._append_note(f"⚠  {w}", color=COLOR_WARNING)
         else:
             self._txt_notes.append("No warnings — standard fitting.")
 
         if candidate.fit_notes:
-            self._txt_notes.append(f"<br><i>Manufacturer note: {candidate.fit_notes}</i>")
+            self._txt_notes.append(
+                f"<br><i>Manufacturer note: {candidate.fit_notes}</i>"
+            )
+
+        # Determine which axis to display
+        axis_display = (
+            candidate.lars_corrected_axis
+            if candidate.lars_corrected_axis is not None
+            else candidate.ordered_axis
+        )
+        lars_tag = " (LARS-corrected ✓)" if candidate.lars_corrected_axis is not None else ""
 
         detail = (
             f"<br><b>Suggested CL order:</b><br>"
-            f"  Sph {candidate.ordered_sphere:+.2f} D | "
-            f"  Cyl {candidate.ordered_cylinder:+.2f} D | "
-            f"  Axis {candidate.ordered_axis}deg | "
-            f"  BC {candidate.ordered_bc:.2f} mm | "
+            f"  Sph {candidate.ordered_sphere:+.2f} D  |  "
+            f"  Cyl {candidate.ordered_cylinder:+.2f} D  |  "
+            f"  Axis {axis_display}°{lars_tag}  |  "
+            f"  BC {candidate.ordered_bc:.2f} mm  |  "
             f"  Dia {candidate.ordered_diameter:.1f} mm"
         )
         if candidate.ordered_addition:
-            detail += f" | Add {candidate.ordered_addition}"
+            detail += f"  |  Add {candidate.ordered_addition}"
         self._txt_notes.append(detail)
 
-    def _on_reset(self):
-        """Reset all input fields."""
+        dk_info = f"<br><small>Material: {candidate.material} · Dk/t: {candidate.dk_t}</small>"
+        self._txt_notes.append(dk_info)
+
+    # LARS correction slot
+
+    def _on_apply_lars(self) -> None:
+        """
+        Apply the LARS correction to the selected row in the active table.
+
+        Determines which table is active by checking which has a current selection.
+        Updates the candidate's lars_corrected_axis and refreshes the table row.
+        """
+        from controllers.matching_engine import MatchingEngine
+
+        drift = self._lars_spin.value()
+        if drift == 0:
+            self._append_note(
+                "LARS: drift is 0° — no correction applied.", color=COLOR_TEXT_DIM
+            )
+            return
+
+        # Find the table that has an active selection
+        active_tbl = None
+        active_eye = None
+        for eye, tbl_tuple in [("od", self._tbl_od), ("os", self._tbl_os)]:
+            if tbl_tuple[1].selectedItems():
+                active_tbl = tbl_tuple[1]
+                active_eye = eye
+                break
+
+        if active_tbl is None:
+            self._append_note(
+                "LARS: select a toric lens row in a result table first.",
+                color=COLOR_WARNING,
+            )
+            return
+
+        sel = active_tbl.selectedItems()
+        row = sel[0].row()
+        score_item = active_tbl.item(row, 0)
+        if score_item is None:
+            return
+
+        candidate = score_item.data(Qt.UserRole)
+        if candidate is None:
+            return
+
+        if candidate.ordered_cylinder == 0.0:
+            self._append_note(
+                "LARS: selected lens is spherical — no axis to correct.",
+                color=COLOR_WARNING,
+            )
+            return
+
+        original_axis = candidate.ordered_axis
+        corrected_axis = MatchingEngine.apply_lars(original_axis, drift)
+        candidate.lars_corrected_axis = corrected_axis
+
+        # Refresh display
+        self._populate_table(active_tbl, self._last_candidates[active_eye])
+
+        # Re-select the same row
+        active_tbl.selectRow(row)
+
+        self._append_note(
+            f"LARS applied: axis {original_axis}° + drift {drift:+d}° → "
+            f"corrected axis {corrected_axis}°.",
+            color=COLOR_ACCENT2,
+        )
+
+    # Copy prescription slot
+
+    def _on_copy_prescription(self) -> None:
+        """
+        Copy the currently displayed prescription (notes panel) to the clipboard
+        in plain-text format, suitable for pasting into a patient record.
+        """
+        # Find active candidate from whichever table has a selection
+        candidate = None
+        eye_label = ""
+        for eye, tbl_tuple in [("od", self._tbl_od), ("os", self._tbl_os)]:
+            tbl = tbl_tuple[1]
+            sel = tbl.selectedItems()
+            if sel:
+                row = sel[0].row()
+                item = tbl.item(row, 0)
+                if item:
+                    candidate = item.data(Qt.UserRole)
+                    eye_label = "Right Eye (OD)" if eye == "od" else "Left Eye (OS)"
+                break
+
+        if candidate is None:
+            self._append_note(
+                "Copy: select a lens row first.", color=COLOR_WARNING
+            )
+            return
+
+        axis_display = (
+            candidate.lars_corrected_axis
+            if candidate.lars_corrected_axis is not None
+            else candidate.ordered_axis
+        )
+        lars_note = " [LARS-corrected]" if candidate.lars_corrected_axis is not None else ""
+
+        lines = [
+            f"LensAdvisor — Prescription Summary",
+            f"Eye:      {eye_label}",
+            f"Brand:    {candidate.brand}",
+            f"Model:    {candidate.model}",
+            f"Material: {candidate.material}  |  Dk/t: {candidate.dk_t}",
+            f"---",
+            f"Sphere:   {candidate.ordered_sphere:+.2f} D",
+            f"Cylinder: {candidate.ordered_cylinder:+.2f} D",
+            f"Axis:     {axis_display}°{lars_note}",
+            f"BC:       {candidate.ordered_bc:.2f} mm",
+            f"Diameter: {candidate.ordered_diameter:.1f} mm",
+        ]
+        if candidate.ordered_addition:
+            lines.append(f"Addition: {candidate.ordered_addition}")
+        if candidate.warnings:
+            lines.append("---")
+            lines.append("Warnings:")
+            for w in candidate.warnings:
+                lines.append(f"  * {w}")
+        if candidate.fit_notes:
+            lines.append(f"Note: {candidate.fit_notes}")
+
+        text = "\n".join(lines)
+        QApplication.clipboard().setText(text)
+        self._set_status("Prescription copied to clipboard.")
+        self._append_note("Prescription copied to clipboard.", color=COLOR_ACCENT2)
+
+    # Reset slot
+
+    def _on_reset(self) -> None:
+        """Reset all input fields to defaults."""
         for key, spin in self._inputs.items():
             if isinstance(spin, QSpinBox):
-                spin.setValue(0)
+                spin.setValue(90)  # default axis 90°
             elif "k_r" in key:
                 spin.setValue(7.80 if "r1" in key else 7.60)
             else:
                 spin.setValue(0.0)
         self._vertex_spin.setValue(12.0)
         self._combo_type.setCurrentIndex(0)
+        self._combo_bc_rule.setCurrentIndex(0)
         for cb in self._brand_checks.values():
             cb.setChecked(True)
         self._spin_top_n.setValue(5)
+        self._lars_spin.setValue(0)
         self._clear_tables()
         self._txt_notes.clear()
         for eye in ("od", "os"):
             getattr(self, f"_lbl_lc_{eye}").setText("—")
+        self._last_candidates = {"od": [], "os": []}
+        self._update_kero_display()
         self._set_status("Form reset.")
-
-    def _clear_tables(self):
-        for tbl in (self._tbl_od[1], self._tbl_os[1]):
-            tbl.setRowCount(0)
 
     # Helpers
 
-    def _append_note(self, text: str, color: str = COLOR_TEXT):
+    def _clear_tables(self) -> None:
+        """Remove all rows from both result tables."""
+        for tbl in (self._tbl_od[1], self._tbl_os[1]):
+            tbl.setRowCount(0)
+
+    def _append_note(self, text: str, color: str = COLOR_TEXT) -> None:
+        """Append coloured text to the notes panel."""
         self._txt_notes.setTextColor(QColor(color))
         self._txt_notes.append(text)
         self._txt_notes.setTextColor(QColor(COLOR_TEXT))
 
-    def _set_status(self, msg: str):
+    def _set_status(self, msg: str) -> None:
+        """Update the status bar message."""
         self.statusBar().showMessage(f"  {msg}")

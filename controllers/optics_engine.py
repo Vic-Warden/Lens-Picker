@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+from config import VERTEX_COMPENSATION_THRESHOLD, DEFAULT_VERTEX_MM
+
 
 # Input / output data structures
 
@@ -18,9 +20,9 @@ class SpectacleRx:
     """Spectacle refraction at the lens plane (frame plane)."""
     sphere: float          # diopters
     cylinder: float        # diopters (minus-cylinder convention)
-    axis: int              # degrees 0-180
+    axis: int              # degrees 1-180
     addition: float        # diopters (0 if not presbyopic)
-    vertex_distance: float = 12.0  # mm, vertex distance
+    vertex_distance: float = DEFAULT_VERTEX_MM  # mm, vertex distance
 
 
 @dataclass
@@ -62,11 +64,13 @@ class CLRx:
     axis: int         # cylinder axis (may differ from spectacle axis)
     addition: float
     vertex_distance: float = 0.0  # always 0 for a CL
+    method: str = "standard"      # "standard" or "multifocal_SE"
 
     def __str__(self):
         cyl_str = f"  Cyl {self.cylinder:+.2f} x {self.axis}deg" if self.cylinder else ""
         add_str = f"  Add +{self.addition:.2f}" if self.addition else ""
-        return f"Sph {self.sphere:+.2f}{cyl_str}{add_str}"
+        method_str = " [SE]" if self.method == "multifocal_SE" else ""
+        return f"Sph {self.sphere:+.2f}{cyl_str}{add_str}{method_str}"
 
 
 # Low-level utility functions
@@ -194,13 +198,13 @@ class OpticsEngine:
 
         d = rx.vertex_distance
 
-        # Apply compensation only when |F| > 4 D (clinically significant)
-        if abs(f_meridian_1) > 4.0:
+        # Apply compensation only when |F| > threshold (clinically significant)
+        if abs(f_meridian_1) > VERTEX_COMPENSATION_THRESHOLD:
             f1_cl = vertex_compensation(f_meridian_1, d)
         else:
             f1_cl = f_meridian_1
 
-        if abs(f_meridian_2) > 4.0:
+        if abs(f_meridian_2) > VERTEX_COMPENSATION_THRESHOLD:
             f2_cl = vertex_compensation(f_meridian_2, d)
         else:
             f2_cl = f_meridian_2
@@ -236,6 +240,7 @@ class OpticsEngine:
             axis=rx_axis,
             addition=add,
             vertex_distance=0.0,
+            method="standard",
         )
 
     def compute_cl_refraction_multifocal(self, rx: SpectacleRx) -> CLRx:
@@ -257,7 +262,10 @@ class OpticsEngine:
             addition=rx.addition,
             vertex_distance=rx.vertex_distance,
         )
-        return self.compute_cl_refraction(rx_se)
+        cl_rx = self.compute_cl_refraction(rx_se)
+        # Tag the result so the UI can display the method used
+        cl_rx.method = "multifocal_SE"
+        return cl_rx
 
     @staticmethod
     def compute_spherical_equivalent(sphere: float, cylinder: float) -> float:
